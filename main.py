@@ -1,4 +1,5 @@
 import csv
+import signal
 import threading
 import time
 from collections import deque
@@ -13,14 +14,38 @@ from ai_edge_litert.interpreter import Interpreter
 # ---------------------------------------------------------------------------
 # GPIO
 # ---------------------------------------------------------------------------
-GPIO_PIN     = 17
+GPIO_PIN      = 17
+GPIO_PWM_HZ   = 1000   # PWM carrier frequency in Hz
+GPIO_PWM_DUTY = 50.0   # duty cycle % when "on"
+
 _gpio_handle = lgpio.gpiochip_open(0)
 lgpio.gpio_claim_output(_gpio_handle, GPIO_PIN, lFlags=0, level=0)
 _gpio_state  = 0
 
 def gpio_cleanup():
-    lgpio.gpio_write(_gpio_handle, GPIO_PIN, 0)
-    lgpio.gpiochip_close(_gpio_handle)
+    try:
+        lgpio.tx_pwm(_gpio_handle, GPIO_PIN, 0, 0)
+    except Exception:
+        pass
+    try:
+        lgpio.gpio_write(_gpio_handle, GPIO_PIN, 0)   # actively drive low before releasing
+    except Exception:
+        pass
+    try:
+        lgpio.gpio_claim_input(_gpio_handle, GPIO_PIN, lFlags=lgpio.SET_PULL_DOWN)
+    except Exception:
+        pass
+    try:
+        lgpio.gpiochip_close(_gpio_handle)
+    except Exception:
+        pass
+
+def _signal_handler(sig, frame):
+    gpio_cleanup()
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGHUP,  _signal_handler)
 
 # ---------------------------------------------------------------------------
 # YAMNet model
@@ -33,7 +58,7 @@ output_details = interpreter.get_output_details()
 with open('yamnet_classes.csv', newline='') as f:
     reader = csv.DictReader(f)
     rows   = list(reader)
-    name_col      = 'display_name' if 'display_name' in reader.fieldnames else reader.fieldnames[-1]
+    name_col       = 'display_name' if 'display_name' in reader.fieldnames else reader.fieldnames[-1]
     YAMNET_CLASSES = [r[name_col] for r in rows]
 
 print(f"Loaded {len(YAMNET_CLASSES)} YAMNet classes from CSV")
@@ -55,23 +80,23 @@ HOP           = 512
 # ---------------------------------------------------------------------------
 # Detection config
 # ---------------------------------------------------------------------------
-DESCRIPTOR_GATE    = 20000   # aubio onset strength gate; raise to ignore quiet sounds
-DOUBLE_CLAP_WINDOW = 0.5     # max seconds between two claps to count as a double
-COOLDOWN           = 0       # seconds to ignore triggers after a double clap fires
+DESCRIPTOR_GATE    = 20000
+DOUBLE_CLAP_WINDOW = 0.3
+COOLDOWN           = 0
 YAMNET_TOP_N       = 5
 DEBUG              = True
+CAPTURE_DELAY      = 0.15
 
 # ---------------------------------------------------------------------------
 # Heuristic: composite clap score
 # ---------------------------------------------------------------------------
-HEURISTIC_THRESHOLD = 0.015  # composite must exceed this; lower = more sensitive
+HEURISTIC_THRESHOLD = 0.015
 
 def _find_class(fragment):
     return next(
         (i for i, n in enumerate(YAMNET_CLASSES) if fragment.lower() in n.lower()), None
     )
 
-# Classes that contribute positively to the clap score (tune weights here).
 HEURISTIC_POSITIVE = [
     (_find_class('clapping'),        2.0),
     (_find_class('hands'),           1.5),
@@ -86,9 +111,8 @@ HEURISTIC_POSITIVE = [
     (_find_class('burst'),           0.2),
 ]
 HEURISTIC_POSITIVE = [(i, w) for i, w in HEURISTIC_POSITIVE if i is not None]
-_POSITIVE_SUM = sum(w for _, w in HEURISTIC_POSITIVE)  # 7.1 — normalisation denominator
+_POSITIVE_SUM = sum(w for _, w in HEURISTIC_POSITIVE)
 
-# Classes that suppress the score when they dominate (tune weights here).
 HEURISTIC_NEGATIVE = [
     (_find_class('speech'),        1.2),
     (_find_class('vehicle horn'),  0.3),
@@ -101,7 +125,7 @@ def clap_heuristic_score(scores):
     """Composite clap likelihood in [0, 1]."""
     pos     = sum(scores[i] * w for i, w in HEURISTIC_POSITIVE)
     neg     = sum(scores[i] * w for i, w in HEURISTIC_NEGATIVE)
-    penalty = max(0.0, neg - pos) * 0.5   # only penalise when anti-clap signal dominates
+    penalty = max(0.0, neg - pos) * 0.5
     return float(np.clip((pos - penalty) / _POSITIVE_SUM, 0.0, 1.0))
 
 # ---------------------------------------------------------------------------
@@ -131,8 +155,14 @@ def dbg(msg):
 def trigger():
     global _gpio_state
     _gpio_state ^= 1
-    lgpio.gpio_write(_gpio_handle, GPIO_PIN, _gpio_state)
-    print(f">>> Double clap detected! GPIO {GPIO_PIN} → {'HIGH' if _gpio_state else 'LOW'} <<<")
+    if _gpio_state:
+        lgpio.tx_pwm(_gpio_handle, GPIO_PIN, GPIO_PWM_HZ, GPIO_PWM_DUTY)
+        state_str = f"PWM {GPIO_PWM_DUTY}%"
+    else:
+        lgpio.tx_pwm(_gpio_handle, GPIO_PIN, 0, 0)   # stop PWM
+        lgpio.gpio_write(_gpio_handle, GPIO_PIN, 0)   # actively drive low
+        state_str = "OFF"
+    print(f">>> Double clap detected! GPIO {GPIO_PIN} → {state_str} <<<")
 
 # ---------------------------------------------------------------------------
 # YAMNet worker thread
@@ -148,6 +178,11 @@ def yamnet_worker():
 
         onset_time = onset_queue.popleft()
         dbg(f"yamnet_worker | picked up onset, queue size={len(onset_queue)}")
+
+        elapsed   = time.time() - onset_time
+        remaining = CAPTURE_DELAY - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
         with buffer_lock:
             if len(audio_buffer) < DEVICE_WINDOW:
@@ -215,9 +250,11 @@ threading.Thread(target=yamnet_worker, daemon=True).start()
 
 print("Listening for double claps...")
 print(f"  GPIO pin           : BCM {GPIO_PIN} (toggle)")
+print(f"  GPIO PWM           : {GPIO_PWM_HZ} Hz, {GPIO_PWM_DUTY}% duty when on")
 print(f"  descriptor gate    : {DESCRIPTOR_GATE}")
 print(f"  heuristic threshold: {HEURISTIC_THRESHOLD}")
 print(f"  double clap window : {DOUBLE_CLAP_WINDOW}s")
+print(f"  capture delay      : {CAPTURE_DELAY}s")
 print(f"  cooldown           : {COOLDOWN}s")
 print(f"  debug              : {DEBUG}")
 print()
