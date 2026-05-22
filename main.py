@@ -1,42 +1,34 @@
 import csv
+import queue
 import signal
 import threading
 import time
 from collections import deque
 
 import aubio
-import lgpio
+
 import numpy as np
 import sounddevice as sd
 import soxr
 from ai_edge_litert.interpreter import Interpreter
+from rpi_hardware_pwm import HardwarePWM
 
 # ---------------------------------------------------------------------------
-# GPIO
+# GPIO / Hardware PWM
 # ---------------------------------------------------------------------------
-GPIO_PIN      = 17
-GPIO_PWM_HZ   = 1000   # PWM carrier frequency in Hz
-GPIO_PWM_DUTY = 50.0   # duty cycle % when "on"
+GPIO_PIN      = 18      # must be 18 (PWM ch0) or 19 (PWM ch1) with dtoverlay=pwm
+GPIO_PWM_HZ   = 1000    # PWM carrier frequency in Hz
+GPIO_PWM_DUTY = 50.0    # duty cycle % when "on"
 
-_gpio_handle = lgpio.gpiochip_open(0)
-lgpio.gpio_claim_output(_gpio_handle, GPIO_PIN, lFlags=0, level=0)
-_gpio_state  = 0
+# HardwarePWM channel: GPIO 18/12 = channel 0, GPIO 19/13 = channel 1
+_pwm = HardwarePWM(pwm_channel=0, hz=GPIO_PWM_HZ, chip=0)
+_pwm.start(0)   # initialise with 0% duty (off)
+_gpio_state = 0
+
 
 def gpio_cleanup():
     try:
-        lgpio.tx_pwm(_gpio_handle, GPIO_PIN, 0, 0)
-    except Exception:
-        pass
-    try:
-        lgpio.gpio_write(_gpio_handle, GPIO_PIN, 0)   # actively drive low before releasing
-    except Exception:
-        pass
-    try:
-        lgpio.gpio_claim_input(_gpio_handle, GPIO_PIN, lFlags=lgpio.SET_PULL_DOWN)
-    except Exception:
-        pass
-    try:
-        lgpio.gpiochip_close(_gpio_handle)
+        _pwm.stop()
     except Exception:
         pass
 
@@ -141,7 +133,7 @@ onset_detector.set_silence(-20)
 # ---------------------------------------------------------------------------
 audio_buffer     = deque(maxlen=DEVICE_WINDOW)
 clap_times       = deque(maxlen=10)
-onset_queue      = deque(maxlen=20)
+onset_queue      = queue.Queue(maxsize=20)
 buffer_lock      = threading.Lock()
 last_double_time = 0
 
@@ -156,11 +148,10 @@ def trigger():
     global _gpio_state
     _gpio_state ^= 1
     if _gpio_state:
-        lgpio.tx_pwm(_gpio_handle, GPIO_PIN, GPIO_PWM_HZ, GPIO_PWM_DUTY)
+        _pwm.change_duty_cycle(GPIO_PWM_DUTY)
         state_str = f"PWM {GPIO_PWM_DUTY}%"
     else:
-        lgpio.tx_pwm(_gpio_handle, GPIO_PIN, 0, 0)   # stop PWM
-        lgpio.gpio_write(_gpio_handle, GPIO_PIN, 0)   # actively drive low
+        _pwm.change_duty_cycle(0)
         state_str = "OFF"
     print(f">>> Double clap detected! GPIO {GPIO_PIN} → {state_str} <<<")
 
@@ -172,12 +163,8 @@ def yamnet_worker():
     dbg("yamnet_worker started")
 
     while True:
-        if not onset_queue:
-            time.sleep(0.01)
-            continue
-
-        onset_time = onset_queue.popleft()
-        dbg(f"yamnet_worker | picked up onset, queue size={len(onset_queue)}")
+        onset_time = onset_queue.get()
+        dbg(f"yamnet_worker | picked up onset, queue size={onset_queue.qsize()}")
 
         elapsed   = time.time() - onset_time
         remaining = CAPTURE_DELAY - elapsed
@@ -238,8 +225,11 @@ def audio_callback(indata, frames, time_info, status):
     descriptor = onset_detector.get_descriptor()
     if is_onset:
         if descriptor > DESCRIPTOR_GATE:
-            onset_queue.append(time.time())
-            dbg(f"audio_callback | strong onset passed gate (descriptor={descriptor:.0f})")
+            try:
+                onset_queue.put_nowait(time.time())
+                dbg(f"audio_callback | strong onset passed gate (descriptor={descriptor:.0f})")
+            except queue.Full:
+                dbg("audio_callback | onset queue full, dropping")
         else:
             dbg(f"audio_callback | onset below gate, ignoring (descriptor={descriptor:.0f})")
 
@@ -249,7 +239,7 @@ def audio_callback(indata, frames, time_info, status):
 threading.Thread(target=yamnet_worker, daemon=True).start()
 
 print("Listening for double claps...")
-print(f"  GPIO pin           : BCM {GPIO_PIN} (toggle)")
+print(f"  GPIO pin           : BCM {GPIO_PIN} (hardware PWM, toggle)")
 print(f"  GPIO PWM           : {GPIO_PWM_HZ} Hz, {GPIO_PWM_DUTY}% duty when on")
 print(f"  descriptor gate    : {DESCRIPTOR_GATE}")
 print(f"  heuristic threshold: {HEURISTIC_THRESHOLD}")
@@ -262,8 +252,7 @@ print()
 try:
     with sd.InputStream(callback=audio_callback, samplerate=DEVICE_RATE,
                         channels=1, blocksize=HOP, device=0):
-        while True:
-            sd.sleep(100)
+        threading.Event().wait()
 except KeyboardInterrupt:
     print("\nStopped.")
 finally:
