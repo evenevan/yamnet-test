@@ -6,7 +6,6 @@ import time
 from collections import deque
 
 import aubio
-
 import numpy as np
 import sounddevice as sd
 import soxr
@@ -79,6 +78,12 @@ YAMNET_TOP_N       = 5
 DEBUG              = True
 CAPTURE_DELAY      = 0.15
 
+# Watchdog: exit if no audio callback for this many seconds (systemd restarts)
+WATCHDOG_TIMEOUT   = 120
+
+# Aubio reset: rebuild detector every N seconds to prevent HFC state drift
+AUBIO_RESET_SEC    = 3600
+
 # ---------------------------------------------------------------------------
 # Heuristic: composite clap score
 # ---------------------------------------------------------------------------
@@ -114,7 +119,6 @@ HEURISTIC_NEGATIVE = [
 HEURISTIC_NEGATIVE = [(i, w) for i, w in HEURISTIC_NEGATIVE if i is not None]
 
 def clap_heuristic_score(scores):
-    """Composite clap likelihood in [0, 1]."""
     pos     = sum(scores[i] * w for i, w in HEURISTIC_POSITIVE)
     neg     = sum(scores[i] * w for i, w in HEURISTIC_NEGATIVE)
     penalty = max(0.0, neg - pos) * 0.5
@@ -123,19 +127,27 @@ def clap_heuristic_score(scores):
 # ---------------------------------------------------------------------------
 # Aubio onset detector
 # ---------------------------------------------------------------------------
-onset_detector = aubio.onset("hfc", buf_size=1024, hop_size=HOP, samplerate=DEVICE_RATE)
-onset_detector.set_threshold(0.5)
-onset_detector.set_minioi_ms(100)
-onset_detector.set_silence(-20)
+_aubio_lock = threading.Lock()
+
+def _make_onset():
+    o = aubio.onset("hfc", buf_size=1024, hop_size=HOP, samplerate=DEVICE_RATE)
+    o.set_threshold(0.5)
+    o.set_minioi_ms(100)
+    o.set_silence(-20)
+    return o
+
+onset_detector = _make_onset()
 
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
-audio_buffer     = deque(maxlen=DEVICE_WINDOW)
-clap_times       = deque(maxlen=10)
-onset_queue      = queue.Queue(maxsize=20)
-buffer_lock      = threading.Lock()
-last_double_time = 0
+audio_buffer      = deque(maxlen=DEVICE_WINDOW)
+clap_times        = deque(maxlen=10)
+onset_queue       = queue.Queue(maxsize=20)
+buffer_lock       = threading.Lock()
+last_double_time  = 0
+_callback_count   = 0
+_last_callback_ts = time.time()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -156,11 +168,29 @@ def trigger():
     print(f">>> Double clap detected! GPIO {GPIO_PIN} → {state_str} <<<")
 
 # ---------------------------------------------------------------------------
+# Watchdog thread
+# ---------------------------------------------------------------------------
+def watchdog():
+    dbg(f"watchdog | started (timeout={WATCHDOG_TIMEOUT}s)")
+    time.sleep(WATCHDOG_TIMEOUT)  # grace period for stream to start
+    while True:
+        time.sleep(WATCHDOG_TIMEOUT)
+        age = time.time() - _last_callback_ts
+        if age > WATCHDOG_TIMEOUT:
+            print(f"[{time.time():.3f}] watchdog | DEAD — no callback for {age:.0f}s, triggering restart")
+            gpio_cleanup()
+            raise SystemExit(1)
+        else:
+            dbg(f"watchdog | ok — last callback {age:.1f}s ago, total calls={_callback_count}")
+
+threading.Thread(target=watchdog, daemon=True).start()
+
+# ---------------------------------------------------------------------------
 # YAMNet worker thread
 # ---------------------------------------------------------------------------
 def yamnet_worker():
     global last_double_time
-    dbg("yamnet_worker started")
+    dbg("yamnet_worker | started")
 
     while True:
         onset_time = onset_queue.get()
@@ -216,13 +246,38 @@ def yamnet_worker():
 # Audio callback
 # ---------------------------------------------------------------------------
 def audio_callback(indata, frames, time_info, status):
+    global _callback_count, _last_callback_ts, onset_detector
+
+    _callback_count   += 1
+    _last_callback_ts  = time.time()
+
+    # heartbeat every ~54s
+    if _callback_count % 5000 == 0:
+        dbg(f"audio_callback | heartbeat (calls={_callback_count}, aubio_reset_in="
+            f"{AUBIO_RESET_SEC - (_callback_count * HOP // DEVICE_RATE) % AUBIO_RESET_SEC}s)")
+
+    # periodic aubio reset to prevent HFC state drift
+    aubio_reset_calls = AUBIO_RESET_SEC * DEVICE_RATE // HOP
+    if _callback_count % aubio_reset_calls == 0:
+        with _aubio_lock:
+            onset_detector = _make_onset()
+        dbg(f"audio_callback | aubio reset at call {_callback_count} "
+            f"(uptime={(aubio_reset_calls * HOP / DEVICE_RATE * (_callback_count // aubio_reset_calls)) / 3600:.1f}h)")
+
     if status:
-        print(f"[warning] {status}")
+        print(f"[{time.time():.3f}] audio_callback | WARNING status={status}")
+
     audio = indata[:, 0].astype(np.float32)
     with buffer_lock:
         audio_buffer.extend(audio)
-    is_onset   = onset_detector(audio)
-    descriptor = onset_detector.get_descriptor()
+
+    with _aubio_lock:
+        is_onset   = onset_detector(audio)
+        descriptor = onset_detector.get_descriptor()
+
+    if descriptor > 50000:
+        dbg(f"audio_callback | descriptor={descriptor:.0f} is_onset={bool(is_onset)}")
+
     if is_onset:
         if descriptor > DESCRIPTOR_GATE:
             try:
@@ -246,6 +301,8 @@ print(f"  heuristic threshold: {HEURISTIC_THRESHOLD}")
 print(f"  double clap window : {DOUBLE_CLAP_WINDOW}s")
 print(f"  capture delay      : {CAPTURE_DELAY}s")
 print(f"  cooldown           : {COOLDOWN}s")
+print(f"  watchdog timeout   : {WATCHDOG_TIMEOUT}s")
+print(f"  aubio reset        : every {AUBIO_RESET_SEC}s ({AUBIO_RESET_SEC//3600}h)")
 print(f"  debug              : {DEBUG}")
 print()
 
