@@ -71,18 +71,19 @@ HOP           = 512
 # ---------------------------------------------------------------------------
 # Detection config
 # ---------------------------------------------------------------------------
-DESCRIPTOR_GATE    = 20000
-DOUBLE_CLAP_WINDOW = 0.3
-COOLDOWN           = 0
-YAMNET_TOP_N       = 5
-DEBUG              = True
-CAPTURE_DELAY      = 0.15
+DESCRIPTOR_GATE        = 20000
+DOUBLE_CLAP_MIN        = 0.1   # minimum seconds between two claps
+DOUBLE_CLAP_WINDOW     = 0.5   # maximum seconds between two claps
+COOLDOWN               = 0
+YAMNET_TOP_N           = 5
+DEBUG                  = True
+CAPTURE_DELAY          = 0.15
 
 # Watchdog: exit if no audio callback for this many seconds (systemd restarts)
-WATCHDOG_TIMEOUT   = 120
+WATCHDOG_TIMEOUT       = 120
 
 # Aubio reset: rebuild detector every N seconds to prevent HFC state drift
-AUBIO_RESET_SEC    = 3600
+AUBIO_RESET_SEC        = 3600
 
 # ---------------------------------------------------------------------------
 # Heuristic: composite clap score
@@ -172,7 +173,7 @@ def trigger():
 # ---------------------------------------------------------------------------
 def watchdog():
     dbg(f"watchdog | started (timeout={WATCHDOG_TIMEOUT}s)")
-    time.sleep(WATCHDOG_TIMEOUT)  # grace period for stream to start
+    time.sleep(WATCHDOG_TIMEOUT)
     while True:
         time.sleep(WATCHDOG_TIMEOUT)
         age = time.time() - _last_callback_ts
@@ -229,16 +230,17 @@ def yamnet_worker():
             continue
 
         now    = onset_time
-        recent = [t for t in clap_times if 0 < now - t <= DOUBLE_CLAP_WINDOW]
+        recent = [t for t in clap_times if DOUBLE_CLAP_MIN < now - t <= DOUBLE_CLAP_WINDOW]
         clap_times.append(now)
-        dbg(f"yamnet_worker | clap confirmed, {len(recent)} prior clap(s) in window")
+        dbg(f"yamnet_worker | clap confirmed, {len(recent)} prior clap(s) in window "
+            f"({DOUBLE_CLAP_MIN}s–{DOUBLE_CLAP_WINDOW}s)")
 
         if recent and (now - last_double_time) > COOLDOWN:
             last_double_time = now
             clap_times.clear()
             trigger()
         elif not recent:
-            dbg("yamnet_worker | first clap, waiting for second")
+            dbg("yamnet_worker | first clap (or too close/far), waiting for second")
         else:
             dbg(f"yamnet_worker | in cooldown, {COOLDOWN - (now - last_double_time):.2f}s remaining")
 
@@ -298,7 +300,7 @@ print(f"  GPIO pin           : BCM {GPIO_PIN} (hardware PWM, toggle)")
 print(f"  GPIO PWM           : {GPIO_PWM_HZ} Hz, {GPIO_PWM_DUTY}% duty when on")
 print(f"  descriptor gate    : {DESCRIPTOR_GATE}")
 print(f"  heuristic threshold: {HEURISTIC_THRESHOLD}")
-print(f"  double clap window : {DOUBLE_CLAP_WINDOW}s")
+print(f"  double clap window : {DOUBLE_CLAP_MIN}s – {DOUBLE_CLAP_WINDOW}s")
 print(f"  capture delay      : {CAPTURE_DELAY}s")
 print(f"  cooldown           : {COOLDOWN}s")
 print(f"  watchdog timeout   : {WATCHDOG_TIMEOUT}s")
